@@ -43,7 +43,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 
 # How long a user we just cut is re-checked every cycle. The panel's own sweep
 # that removes the client from the config runs on a ~5 min cadence, so a
@@ -71,6 +71,8 @@ DEFAULTS = {
     # gives an immediate hard error -- the UDP analogue of ss -K's RST. Set to 0
     # to fall back to DROP (e.g. if a client misbehaves on ICMP).
     "UDP_REJECT": "1",
+    # Optional: price of one GB, only used by --audit to show a money figure.
+    "PRICE_PER_GB": "0",
 }
 
 
@@ -779,10 +781,114 @@ def one_cycle(cfg, dry=False, state=None):
     return out
 
 
+def audit(cfg):
+    """Human-readable report: how much is leaking RIGHT NOW, and what it costs.
+
+    Honesty rules:
+      - quota   -> exact overage (up+down-total); we know when they crossed
+      - expired -> traffic used, but we cannot know how much of it came after
+                   expiry, so it is reported as 'in use', not 'leaked'
+      - disabled-> same as expired
+    Only flows that NAME a finished user are counted, so a valid user sharing an
+    address never inflates the number.
+    """
+    price = float(cfg.get("PRICE_PER_GB") or 0)
+    inv = invalid_users(cfg)
+    if not inv:
+        print("\n  Nothing is leaking. Every client is within its limit.\n")
+        return 0
+
+    # per-user traffic, straight from the panel DB
+    used = {}
+    con = sqlite3.connect("file:%s?mode=ro" % cfg["DB"], uri=True, timeout=5)
+    try:
+        con.execute("PRAGMA query_only=1")
+        for email, up, down, total in con.execute(
+                "SELECT email, up, down, total FROM client_traffics"):
+            used[email] = (int(up or 0), int(down or 0), int(total or 0))
+    finally:
+        con.close()
+
+    # who is actually connected right now, and on which port
+    fm = flow_map(cfg)
+    live = {}                      # email -> [(ip, port, proto), ...]
+    if fm:
+        for (ip, port), (email, proto) in fm.items():
+            if email in inv:
+                live.setdefault(email, []).append((ip, port, proto))
+    else:
+        m, err = online_ip_map(cfg)
+        if m:
+            for ip, emails in m.items():
+                for email in emails:
+                    if email in inv:
+                        live.setdefault(email, []).append((ip, 0, "tcp"))
+
+    n_conn = sum(len(v) for v in live.values())
+    overage = 0
+    rows = []
+    for email, reason in sorted(inv.items()):
+        up, down, total = used.get(email, (0, 0, 0))
+        s = up + down
+        o = max(0, s - total) if (total and reason == "quota") else 0
+        overage += o
+        rows.append((o, s, total, email, reason, len(live.get(email, []))))
+
+    rows.sort(reverse=True)
+    leaking = [r for r in rows if r[5]]
+
+    print("")
+    print("  vpn-cutoff audit  --  %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("")
+    print("  finished clients            : %d" % len(inv))
+    print("     disabled                 : %d" % sum(1 for r in inv.values() if r == "disabled"))
+    print("     expired                  : %d" % sum(1 for r in inv.values() if r == "expired"))
+    print("     over quota               : %d" % sum(1 for r in inv.values() if r == "quota"))
+    print("  still connected RIGHT NOW   : %d client(s), %d live flow(s)"
+          % (len(leaking), n_conn))
+    if overage:
+        gb = overage / 1073741824.0
+        line = "  quota overrun, measurable    : %.2f GB" % gb
+        if price:
+            line += "   (~%s at %g/GB)" % (("{:,.0f}".format(gb * price)), price)
+        print(line)
+    print("")
+
+    if leaking:
+        print("  %-28s %-9s %10s %10s %6s" % ("email", "reason", "used", "limit", "flows"))
+        for o, s, total, email, reason, n in leaking[:15]:
+            print("  %-28s %-9s %9.2fG %9s %6d"
+                  % (email[:28], reason, s / 1073741824.0,
+                     ("%.2fG" % (total / 1073741824.0)) if total else "unlimited", n))
+        if len(leaking) > 15:
+            print("  ... and %d more" % (len(leaking) - 15))
+        print("")
+    else:
+        print("  Nothing is connected right now, but %d client(s) are finished."
+              % len(inv))
+        print("")
+
+    # what to do about it
+    has_log = access_log_path(cfg) is not None
+    if not has_log:
+        print("  The access log is OFF, so only whole IP addresses can be cut.")
+        print("  Two users behind one address would both be dropped.")
+        print("  Turn it on for per-user cutting:")
+        print("")
+        print("      sudo bash install-xui-cutoff.sh --with-accesslog")
+        print("")
+    else:
+        print("  Per-user cutting is available (access log is on).")
+        print("")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Cut live sessions of finished x-ui clients")
     ap.add_argument("--once", action="store_true", help="run a single cycle and exit")
     ap.add_argument("--dry-run", action="store_true", help="report, kill nothing")
+    ap.add_argument("--audit", action="store_true",
+                    help="report what is leaking right now, change nothing")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--version", action="version", version=VERSION)
     a = ap.parse_args()
@@ -790,6 +896,9 @@ def main():
 
     if a.selftest:
         return selftest(cfg)
+
+    if a.audit:
+        return audit(cfg)
 
     os.makedirs(cfg["STATE_DIR"], exist_ok=True)
     if a.once or a.dry_run:
