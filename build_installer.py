@@ -18,7 +18,7 @@ def b64(name):
 WATCHER = b64("xui_user_cutoff.py")
 ACCLOG = b64("set_accesslog.py")
 LOGROT = b64("xray-access.logrotate")
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 
 TEMPLATE = r'''#!/bin/bash
 # xui-user-cutoff installer (self-contained) -- v@VERSION@
@@ -226,6 +226,17 @@ except Exception: print("?")
 PY
 )
   say "  access log  : $acc"
+  say "  no-restart  : $(python3 - "$DB" <<'PY'
+import sqlite3,sys
+try:
+    c=sqlite3.connect("file:%s?mode=ro"%sys.argv[1],uri=True)
+    r=c.execute("SELECT value FROM settings WHERE key='restartXrayOnClientDisable'").fetchone()
+    v=(r[0] if r else "")
+    print({"false":"on (panel will not restart xray)","true":"OFF - panel restarts xray on every change"}.get(v, v or "absent"))
+except Exception as e:
+    print("?")
+PY
+)"
   say "  flow drops  : $(iptables -S INPUT 2>/dev/null | grep -c 'xui-cutoff-flow' || true)"
   say "  ip drops    : $(iptables -S INPUT 2>/dev/null | grep -c 'xui-cutoff' || true)"
   [ -f /var/log/xui-user-cutoff.log ] && { say "  recent:"; tail -3 /var/log/xui-user-cutoff.log | sed 's/^/    /'; }
@@ -241,6 +252,50 @@ do_uninstall(){
   iptables -S INPUT 2>/dev/null | grep 'xui-cutoff' | grep -v '^-N' \
     | sed 's/^-A/iptables -D/' | sh 2>/dev/null || true
   say "done (access log setting left as-is; use the panel to disable it)"
+}
+
+# ---------- the panel's xray-restart switch ----------
+# 3x-ui ships restartXrayOnClientDisable=true. That makes the panel restart
+# xray on EVERY client/inbound add, edit, enable, disable, expiry and quota
+# event -- which drops every connected user for a few seconds. With this tool
+# installed that restart is both unnecessary (we cut the finished session
+# ourselves) and actively harmful. Turn it off, and only if it is currently on,
+# because flipping it is itself a settings write.
+do_no_restart(){
+  local cur
+  cur=$(python3 - "$DB" <<'PY'
+import sqlite3,sys
+try:
+    c=sqlite3.connect("file:%s?mode=ro"%sys.argv[1],uri=True)
+    r=c.execute("SELECT value FROM settings WHERE key='restartXrayOnClientDisable'").fetchone()
+    print((r[0] if r else "") or "absent")
+except Exception as e:
+    print("err:%s"%e)
+PY
+)
+  case "$cur" in
+    false)
+      say "panel restart-on-disable: already off"
+      return 0 ;;
+    absent)
+      warn "setting restartXrayOnClientDisable not present; leaving it alone"
+      return 0 ;;
+    err:*)
+      warn "could not read restartXrayOnClientDisable (${cur#err:})"
+      return 0 ;;
+  esac
+  say "panel restart-on-disable: '$cur' -> turning OFF"
+  say "  (this stops the panel from dropping every connected user on each"
+  say "   client add/edit/disable/expiry -- vpn-cutoff handles the cut instead)"
+  python3 - "$DB" <<'PY'
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+c.execute("UPDATE settings SET value='false' WHERE key='restartXrayOnClientDisable'")
+if c.total_changes==0:
+    c.execute("INSERT INTO settings(key,value) VALUES('restartXrayOnClientDisable','false')")
+c.commit()
+print("  rows changed:",c.total_changes)
+PY
 }
 
 do_accesslog(){
@@ -294,6 +349,10 @@ WG=wg
 # 1 = block UDP flows with REJECT+ICMP (instant for TCP-like clients, still
 # bounded by the QUIC idle timeout for hysteria because QUIC ignores ICMP)
 UDP_REJECT=1
+# price of one GB, used only by --audit to put a money figure on the leak.
+# Unit is whatever you bill in (Toman, USD, ...) -- printed as-is.
+# Set to 0 to hide the money line.
+PRICE_PER_GB=10000
 CONF
 
   if [ ! -f "$UNIT" ]; then
@@ -327,6 +386,9 @@ UNITEOF
   say "selftest:"
   python3 "$PY" --selftest || die "selftest FAILED -- nothing started"
 
+  say ""
+  do_no_restart
+
   systemctl daemon-reload
   systemctl enable xui-user-cutoff >/dev/null 2>&1 || true
   systemctl restart xui-user-cutoff
@@ -344,6 +406,7 @@ for a in "$@"; do
     --accesslog-only) MODE=log-only ;;
     --uninstall)      MODE=uninstall ;;
     --status)         MODE=status ;;
+    --audit)          MODE=audit ;;
     -h|--help)        sed -n '2,20p' "$0"; exit 0 ;;
     *) die "unknown option: $a" ;;
   esac
@@ -353,6 +416,10 @@ case "$MODE" in
   status)   do_status ;;
   uninstall) do_uninstall ;;
   log-only) do_accesslog on ;;
+  audit)    install_prereqs; detect
+            XUI_CUTOFF_DB="$DB" XUI_CUTOFF_CONFIG="$CONFIG" \
+            XUI_CUTOFF_XRAY_BIN="$XRAY" XUI_CUTOFF_API_ADDR="127.0.0.1:$APIPORT" \
+            python3 "$TMP/watcher.py" --audit ;;
   install)  do_install ;;
   install-with-log) do_install; say ""; do_accesslog on ;;
 esac
