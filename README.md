@@ -30,6 +30,10 @@ No restart, ever. The core process is not touched.
 
 ## Install
 
+3x-ui must already be installed, with at least one inbound created. Everything
+else — `python3`, `iproute2` (`ss -K`), `iptables` — is detected and installed
+automatically. apt, dnf, yum, apk, pacman and zypper are all handled.
+
 **Requires the access log for per-flow precision.** Read
 [Access log](#access-log-why-it-is-required) below before choosing a mode.
 
@@ -37,6 +41,17 @@ No restart, ever. The core process is not touched.
 curl -fsSL https://raw.githubusercontent.com/itsRealRad/vpn-cutoff/main/install-xui-cutoff.sh -o /tmp/i.sh
 sudo bash /tmp/i.sh --with-accesslog
 ```
+
+That is the whole procedure on a fresh host that already has the panel.
+
+If the panel is missing the installer stops and says so:
+
+```
+  3x-ui is not installed on this host.
+  Install the panel first, create one inbound, then re-run this installer.
+```
+
+A host without systemd is refused outright; there is no init fallback.
 
 Or copy the single file and run it:
 
@@ -52,11 +67,12 @@ ssh root@HOST 'bash /root/install-xui-cutoff.sh --with-accesslog'
 | `install-xui-cutoff.sh` | Install / upgrade. Does **not** touch the Xray log. |
 | `install-xui-cutoff.sh --with-accesslog` | Install and enable the access log. |
 | `install-xui-cutoff.sh --accesslog-only` | Only enable the access log. |
-| `install-xui-cutoff.sh --status` | Version, service state, log path, owned rules. |
+| `install-xui-cutoff.sh --status` | Version, service state, log path, owned rules, missing prerequisites. |
 | `install-xui-cutoff.sh --uninstall` | Remove the service, files and **its own** iptables rules. |
 
-The installer auto-detects the DB, config, Xray binary and API port. A built-in
-selftest gates the install: if it fails, nothing is started.
+The installer auto-detects the DB, config, Xray binary and API port, installs
+any missing OS prerequisite, and gates the whole install on a built-in selftest:
+if the selftest fails, nothing is started.
 
 ## Access log (why it is required)
 
