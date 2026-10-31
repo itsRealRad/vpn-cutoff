@@ -43,7 +43,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 
 # How long a user we just cut is re-checked every cycle. The panel's own sweep
 # that removes the client from the config runs on a ~5 min cadence, so a
