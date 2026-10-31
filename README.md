@@ -1,29 +1,32 @@
-# xui-user-cutoff
+# vpn-cutoff
 
-Cut the **live** sessions of finished 3x-ui / Xray clients — expired, over
-quota, or disabled — without restarting Xray.
+Cut the **live** sessions of finished 3x-ui clients — expired, over quota, or
+disabled — without restarting the core.
+
+Works on **three core types**, each cut through the lever that core actually
+exposes:
+
+| Core / inbound | How the live session is cut |
+|---|---|
+| **Xray** — TCP inbounds (VLESS, VMess, Trojan, Shadowsocks, xhttp/ws/tcp, behind a CDN or not) | `ss -K` on the exact 5-tuple |
+| **Xray** — UDP/QUIC inbounds (Hysteria, TUIC, MASQUE) | per-flow `iptables` block keyed on the client's source port |
+| **AmneziaWG** kernel inbounds | `awg set <iface> peer <pubkey> remove` |
+| **WireGuard** kernel inbounds | `wg set <iface> peer <pubkey> remove` |
 
 The 3x-ui panel removes a finished client from the running config, which stops
 *new* logins. With `restartXrayOnClientDisable=false` the panel never drops the
-sockets that are **already open**, so a finished user keeps using the tunnel
-until their own client happens to disconnect. This tool closes that gap.
+sessions that are **already open**, so a finished user keeps using the tunnel
+until their own client happens to disconnect. This tool closes that gap — and
+it covers the kernel-backed WireGuard-family inbounds too, whose peers the panel
+also leaves in place.
 
 ## What it does
 
 Every 2 seconds it reads the panel DB (read-only) for clients that are
 disabled, expired, or over quota. For any of them still online, it cuts the
-exact session:
+exact session using the lever from the table above.
 
-- **TCP** inbounds (VLESS, VMess, Trojan, Shadowsocks, xhttp/ws/tcp, including
-  anything behind Cloudflare or another CDN) — killed with `ss -K` on the exact
-  5-tuple. Immediate.
-- **UDP / QUIC** inbounds (Hysteria, TUIC, MASQUE) — blocked per-flow with an
-  `iptables` rule keyed on the client's source port. QUIC has no reset, so the
-  client notices on its own idle timeout rather than instantly.
-- **Kernel WireGuard family** (`amneziawg`, `wireguard`) — the peer is removed
-  with `awg`/`wg set <iface> peer <pk> remove`.
-
-No restart, ever. The Xray process is not touched.
+No restart, ever. The core process is not touched.
 
 ## Install
 
@@ -31,7 +34,7 @@ No restart, ever. The Xray process is not touched.
 [Access log](#access-log-why-it-is-required) below before choosing a mode.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/itsRealRad/xui-user-cutoff/main/install-xui-cutoff.sh -o /tmp/i.sh
+curl -fsSL https://raw.githubusercontent.com/itsRealRad/vpn-cutoff/main/install-xui-cutoff.sh -o /tmp/i.sh
 sudo bash /tmp/i.sh --with-accesslog
 ```
 
@@ -65,7 +68,7 @@ With the access log, every accepted connection is recorded with the client's
 real source address, source port **and** email:
 
 ```
-from 5.201.217.97:61688 accepted tcp:... [in-60971-udp >> direct] email: Mine
+from 198.51.100.24:41872 accepted tcp:... [in-example-udp >> direct] email: alice
 ```
 
 That `ip:port` identifies exactly one kernel flow, so one user can be cut while
