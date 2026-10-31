@@ -1,5 +1,7 @@
 # vpn-cutoff
 
+**فارسی:** [README.fa.md](README.fa.md)
+
 Cut the **live** sessions of finished 3x-ui clients — expired, over quota, or
 disabled — without restarting the core.
 
