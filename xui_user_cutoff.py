@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Cut the LIVE sessions of x-ui clients that are expired / over quota / disabled.
+"""Cut the LIVE sessions of finished 3x-ui clients without restarting a core.
 
-The 3x-ui panel removes a finished client from the running Xray config, which
-stops NEW connections, but with `restartXrayOnClientDisable=false` it never
-drops the sockets that are already open -- so a finished user keeps using the
-tunnel until their client happens to disconnect. This tool closes that gap.
+Three core families are covered, each cut through the lever that core exposes:
 
-Method (no restart, no restart of the core):
+  Xray, TCP inbound  -> `ss -K` on the exact 5-tuple (immediate)
+  Xray, UDP/QUIC     -> per-flow `iptables` REJECT keyed on the client's
+                        source port (Hysteria, TUIC, MASQUE)
+  WireGuard family   -> `wg`/`awg set <iface> peer <pubkey> remove`
+                        (kernel wireguard and amneziawg inbounds)
+
+The 3x-ui panel removes a finished client from the running config, which stops
+NEW connections, but with `restartXrayOnClientDisable=false` it never drops the
+sessions that are already open -- and for kernel WireGuard-family inbounds it
+leaves the peer in the interface too. A finished user therefore keeps using the
+tunnel until their own client happens to disconnect. This tool closes that gap.
+
+Method (no restart, no restart of any core):
   1. Read the panel DB read-only and compute the INVALID client set
      (enable=0  OR  expired  OR  quota exhausted).
   2. Ask the running Xray core for its OWN per-user online IP map
@@ -179,8 +188,8 @@ def online_ip_map(cfg):
 
 
 # One access-log line is written per accepted connection. Observed shapes:
-#   from <ip>:<port> accepted tcp:<dest>:<dport> [in-8443-tcp >> direct] email: Mine
-#   from <ip>:<port> accepted tcp:<dest>:<dport> [in-60971-udp >> direct] email: Enchantress
+#   from <ip>:<port> accepted tcp:<dest>:<dport> [in-example-tcp >> direct] email: alice
+#   from <ip>:<port> accepted tcp:<dest>:<dport> [in-example-udp >> direct] email: bob
 #   from <ip>:<port> accepted tcp:127.0.0.1:62789 [api -> api]          (no email)
 #
 # IMPORTANT: the `tcp:`/`udp:` right after `accepted` describes the DESTINATION
@@ -900,7 +909,7 @@ def selftest(cfg):
     orig = (udp_ports, existing_drops, drop_ip, undrop_ip)
     rules = set()                     # (ip, port)
 
-    globals()["udp_ports"] = lambda c: {60971}
+    globals()["udp_ports"] = lambda c: {4443}
     globals()["existing_drops"] = lambda c: _group(rules)
 
     def _drop(c, ip, p, dry=False):
@@ -917,21 +926,21 @@ def selftest(cfg):
         # exclusive invalid ip -> dropped
         r = udp_cutoff(cfg3, {"bad": "quota"}, {"1.1.1.1": {"bad"}}, dry=False)
         check("udp: exclusive-invalid ip gets a DROP",
-              (("1.1.1.1", 60971) in rules) and r["added"] == 1)
+              (("1.1.1.1", 4443) in rules) and r["added"] == 1)
         # shared ip -> skipped
         r = udp_cutoff(cfg3, {"bad": "quota"}, {"2.2.2.2": {"bad", "good"}}, dry=False)
         check("udp: shared-with-valid ip is SKIPPED",
-              (("2.2.2.2", 60971) not in rules) and r["skipped"] == 1)
+              (("2.2.2.2", 4443) not in rules) and r["skipped"] == 1)
         # the invalid user is re-enabled -> the DROP must be released
-        rules.add(("1.1.1.1", 60971))   # (a stale rule was already reaped above)
+        rules.add(("1.1.1.1", 4443))   # (a stale rule was already reaped above)
         r = udp_cutoff(cfg3, {}, {"1.1.1.1": {"bad"}}, dry=False)
         check("udp: released when the user becomes valid",
-              (("1.1.1.1", 60971) not in rules) and r["removed"] == 1)
+              (("1.1.1.1", 4443) not in rules) and r["removed"] == 1)
         # stale rule with no live holder -> released
-        rules.add(("3.3.3.3", 60971))
+        rules.add(("3.3.3.3", 4443))
         udp_cutoff(cfg3, {"bad": "quota"}, {}, dry=False)
         check("udp: stale rule with no holder is released",
-              ("3.3.3.3", 60971) not in rules)
+              ("3.3.3.3", 4443) not in rules)
     finally:
         for name, fn in zip(("udp_ports", "existing_drops", "drop_ip", "undrop_ip"), orig):
             globals()[name] = fn
@@ -943,32 +952,33 @@ def selftest(cfg):
         cfg4["CONFIG"] = os.path.join(td, "config.json")
         logp = os.path.join(td, "access.log")
         json.dump({"log": {"access": logp, "loglevel": "info"}, "inbounds": [
-            {"tag": "in-8443-tcp", "port": 8443, "protocol": "vless",
+            {"tag": "in-example-tcp", "port": 1443, "protocol": "vless",
              "streamSettings": {"network": "xhttp"}},
-            {"tag": "in-60971-udp", "port": 60971, "protocol": "hysteria",
+            {"tag": "in-example-udp", "port": 4443, "protocol": "hysteria",
              "streamSettings": {"network": "hysteria"}},
             {"tag": "api", "port": 62789, "protocol": "tunnel"},
         ]}, open(cfg4["CONFIG"], "w"))
         _PORT_CACHE.clear()
-        # EXACT shapes seen in production, incl. the trap: a hysteria (UDP)
-        # session whose line says `accepted tcp:` (dest network, not transport).
+        # Representative shapes, incl. the trap: a hysteria (UDP) session whose
+        # line says `accepted tcp:` (dest network, not inbound transport).
+        # Addresses are from the RFC 5737 documentation ranges.
         with open(logp, "w") as fh:
-            fh.write("2026/10/31 04:09:28.045319 from 89.34.49.116:35027 accepted tcp:example.com:443 [in-8443-tcp >> direct] email: Mine\n")
-            fh.write("2026/10/31 04:38:24.238421 from 5.201.217.97:61688 accepted tcp:57.144.244.192:443 [in-60971-udp >> direct] email: Enchantress\n")
-            fh.write("2026/10/31 04:09:30.2 from 89.34.49.116:35028 accepted tcp:other.com:443 [in-8443-tcp >> direct] email: Linux-homeserver\n")
-            fh.write("2026/10/31 04:45:13.004027 from 127.0.0.1:11228 accepted tcp:127.0.0.1:62789 [api -> api]\n")
+            fh.write("2026/01/01 00:00:00.000000 from 198.51.100.24:41001 accepted tcp:example.com:443 [in-example-tcp >> direct] email: alice\n")
+            fh.write("2026/01/01 00:00:01.000000 from 203.0.113.9:41002 accepted tcp:example.net:443 [in-example-udp >> direct] email: bob\n")
+            fh.write("2026/01/01 00:00:02.000000 from 198.51.100.24:41003 accepted tcp:example.org:443 [in-example-tcp >> direct] email: carol\n")
+            fh.write("2026/01/01 00:00:03.000000 from 127.0.0.1:41004 accepted tcp:127.0.0.1:62789 [api -> api]\n")
         fm = flow_map(cfg4)
         check("flow: tcp line parsed with port+email",
-              fm.get(("89.34.49.116", 35027)) == ("Mine", "tcp"))
+              fm.get(("198.51.100.24", 41001)) == ("alice", "tcp"))
         check("flow: hysteria line is UDP despite 'accepted tcp:' token",
-              fm.get(("5.201.217.97", 61688)) == ("Enchantress", "udp"))
+              fm.get(("203.0.113.9", 41002)) == ("bob", "udp"))
         check("flow: two users on one IP are separate flows",
-              fm.get(("89.34.49.116", 35028)) == ("Linux-homeserver", "tcp"))
+              fm.get(("198.51.100.24", 41003)) == ("carol", "tcp"))
         check("flow: api line (no email) ignored", len(fm) == 3)
 
         # the shared-IP case that the per-IP pass must skip is solved here:
         # only the invalid user's port is targeted, never the whole address
-        inv4 = {"Mine": "disabled"}
+        inv4 = {"alice": "disabled"}
         calls = []
         orig_kf = globals()["kill_flow"]
         orig_efd = globals()["existing_flow_drops"]
@@ -983,14 +993,14 @@ def selftest(cfg):
         globals()["flow_undrop"] = lambda c, ip, sp, dp, dry=False: True
         cfg4["LOG"] = "/dev/null"
         try:
-            r = perflow_cutoff(cfg4, inv4, {8443, 80, 60971}, {60971}, dry=False)
+            r = perflow_cutoff(cfg4, inv4, {1443, 80, 4443}, {4443}, dry=False)
             check("perflow: only the invalid user's tcp flow is killed",
-                  (("89.34.49.116", 35027) in calls) and
-                  (("89.34.49.116", 35028) not in calls))
+                  (("198.51.100.24", 41001) in calls) and
+                  (("198.51.100.24", 41003) not in calls))
             check("perflow: shared-ip valid user untouched",
-                  not any(c[1] == 35028 for c in calls))
+                  not any(c[1] == 41003 for c in calls))
             check("perflow: valid user's udp flow not dropped",
-                  not any(c[0] == "5.201.217.97" for c in calls))
+                  not any(c[0] == "203.0.113.9" for c in calls))
         finally:
             globals()["kill_flow"] = orig_kf
             globals()["existing_flow_drops"] = orig_efd
@@ -1007,10 +1017,10 @@ def selftest(cfg):
         globals()["flow_undrop"] = lambda c, ip, sp, dp, dry=False: True
         cfg4["LOG"] = "/dev/null"
         try:
-            r = perflow_cutoff(cfg4, {"Enchantress": "quota"}, {8443, 60971},
-                               {60971}, dry=False)
+            r = perflow_cutoff(cfg4, {"bob": "quota"}, {1443, 4443},
+                               {4443}, dry=False)
             check("perflow: invalid hysteria user gets per-flow UDP drop",
-                  ("5.201.217.97", 61688, 60971) in calls2)
+                  ("203.0.113.9", 41002, 4443) in calls2)
         finally:
             globals()["kill_flow"] = orig_kf
             globals()["existing_flow_drops"] = orig_efd
@@ -1023,23 +1033,23 @@ def selftest(cfg):
         json.dump({"log": {"access": "none"}, "inbounds": []}, open(cfg4["CONFIG"], "w"))
         _PORT_CACHE.clear()
         check("perflow: returns None when access log is off",
-              perflow_cutoff(cfg4, inv4, {80}, {60971}, dry=True) is None)
+              perflow_cutoff(cfg4, inv4, {80}, {4443}, dry=True) is None)
         _PORT_CACHE.clear()
 
     # --- existing_flow_drops must strip iptables' /32 (or it churns forever) ---
     orig_run = subprocess.run
-    FAKE = ("-A INPUT -s 212.80.12.162/32 -p udp -m udp --sport 54648 "
-            "--dport 60971 -m comment --comment xui-cutoff-flowr -j REJECT "
+    FAKE = ("-A INPUT -s 203.0.113.77/32 -p udp -m udp --sport 41001 "
+            "--dport 4443 -m comment --comment xui-cutoff-flowr -j REJECT "
             "--reject-with icmp-port-unreachable\n"
-            "-A INPUT -s 212.80.12.162/32 -p udp -m udp --sport 9999 "
-            "--dport 60971 -m comment --comment xui-cutoff-flow -j DROP\n")
+            "-A INPUT -s 203.0.113.77/32 -p udp -m udp --sport 41002 "
+            "--dport 4443 -m comment --comment xui-cutoff-flow -j DROP\n")
     subprocess.run = lambda *a, **k: type("R", (), {"stdout": FAKE,
                                                     "returncode": 0})()
     try:
         have = existing_flow_drops(cfg)
         check("drops: /32 stripped so rules are recognised (no churn)",
-              ("212.80.12.162", 54648, 60971) in have and
-              ("212.80.12.162", 9999, 60971) in have and
+              ("203.0.113.77", 41001, 4443) in have and
+              ("203.0.113.77", 41002, 4443) in have and
               not any("/32" in h[0] for h in have))
     finally:
         subprocess.run = orig_run
