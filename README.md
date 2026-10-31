@@ -3,6 +3,41 @@
 Cut the **live** sessions of finished 3x-ui clients — expired, over quota, or
 disabled — without restarting the core.
 
+## The two problems this solves, in order
+
+**1. The panel restarts Xray on almost everything you do.**
+
+3x-ui ships `restartXrayOnClientDisable=true`. With it on, the core restarts
+whenever you create an inbound, create a client, edit either one, disable
+either one, or when a client hits its quota or expires. Every restart drops
+**every connected user** for a few seconds.
+
+Think about what that means in practice. Your bot sells a 100 MB trial to
+someone who may never become a customer — that creation disconnects all your
+paying clients. That trial runs out, another disconnect. One trial sale and one
+trial expiry can each knock everyone off several times a day: a stalled YouTube
+or Instagram video, a lag spike and packet loss in a game, a dropped video call
+or trading session. Real money, real cancellations, several times a day.
+
+So you turn that switch off. Nothing restarts, everyone stays connected.
+
+**2. Now a finished client never gets disconnected at all.**
+
+The panel only removes a finished client from the *running* config. Sessions
+that are **already open** are untouched, so a user whose quota ran out keeps
+tunnelling traffic until their own client happens to reconnect. That is the
+same bug that, during the national shutdowns, let people pull 100 GB through a
+100 MB trial account and cost panel owners millions.
+
+`vpn-cutoff` is the answer to the second problem. It reads the panel DB
+(read-only), finds the clients that are finished *right now*, and cuts exactly
+their live sessions — leaving everyone else connected.
+
+So: turn the restart off, install this, and you get both properties at once.
+The installer turns the switch off for you (and reports it either way).
+
+## How each core is cut
+
 Works on **three core types**, each cut through the lever that core actually
 exposes:
 
@@ -13,13 +48,6 @@ exposes:
 | **AmneziaWG** kernel inbounds | `awg set <iface> peer <pubkey> remove` |
 | **WireGuard** kernel inbounds | `wg set <iface> peer <pubkey> remove` |
 
-The 3x-ui panel removes a finished client from the running config, which stops
-*new* logins. With `restartXrayOnClientDisable=false` the panel never drops the
-sessions that are **already open**, so a finished user keeps using the tunnel
-until their own client happens to disconnect. This tool closes that gap — and
-it covers the kernel-backed WireGuard-family inbounds too, whose peers the panel
-also leaves in place.
-
 ## What it does
 
 Every 2 seconds it reads the panel DB (read-only) for clients that are
@@ -27,6 +55,25 @@ disabled, expired, or over quota. For any of them still online, it cuts the
 exact session using the lever from the table above.
 
 No restart, ever. The core process is not touched.
+
+## What it deliberately does NOT do
+
+This matters more than the feature list, because the tool kills connections:
+
+- **never restarts Xray** — not on install, not on upgrade, not on cut. The only
+  restart the installer can trigger is the one-time x-ui restart that the access
+  log needs, and that is opt-in (`--with-accesslog`).
+- **writes nothing to the panel DB except one setting** — its own
+  `restartXrayOnClientDisable=false`. Everything else is opened read-only
+  (`PRAGMA query_only=1`). No client, traffic counter or inbound is modified.
+- **never kills a shared IP** — if two users sit behind one address, the per-IP
+  fallback skips both rather than cutting a paying customer. Per-user cutting
+  (access log) removes that limitation entirely.
+- **only touches rules it owns** — iptables rules carry an `xui-cutoff` comment;
+  `--uninstall` removes exactly those and nothing else.
+- **stops rather than guesses** — a missing 3x-ui, a missing prerequisite it
+  cannot install, or a failed selftest all abort the install with nothing
+  started.
 
 ## Install
 
@@ -64,15 +111,50 @@ ssh root@HOST 'bash /root/install-xui-cutoff.sh --with-accesslog'
 
 | Command | Effect |
 |---|---|
-| `install-xui-cutoff.sh` | Install / upgrade. Does **not** touch the Xray log. |
+| `install-xui-cutoff.sh --audit` | **Start here.** Report what is leaking right now. Changes nothing, installs nothing. |
+| `install-xui-cutoff.sh` | Install / upgrade. Does **not** touch the Xray log. Turns off the panel's restart switch. |
 | `install-xui-cutoff.sh --with-accesslog` | Install and enable the access log. |
 | `install-xui-cutoff.sh --accesslog-only` | Only enable the access log. |
-| `install-xui-cutoff.sh --status` | Version, service state, log path, owned rules, missing prerequisites. |
+| `install-xui-cutoff.sh --status` | Version, service state, log path, owned rules, missing prerequisites, restart switch. |
 | `install-xui-cutoff.sh --uninstall` | Remove the service, files and **its own** iptables rules. |
 
 The installer auto-detects the DB, config, Xray binary and API port, installs
-any missing OS prerequisite, and gates the whole install on a built-in selftest:
-if the selftest fails, nothing is started.
+any missing OS prerequisite, turns off `restartXrayOnClientDisable`, and gates
+the whole install on a built-in selftest: if the selftest fails, nothing is
+started.
+
+## See the leak before you install
+
+`--audit` reads the panel DB and the access log and prints what is happening on
+this host right now. It never writes, never kills, never installs:
+
+```
+  vpn-cutoff audit  --  2026-10-31 20:52:26
+
+  finished clients            : 23
+     disabled                 : 3
+     expired                  : 20
+     over quota               : 0
+  still connected RIGHT NOW   : 4 client(s), 6 live flow(s)
+  quota overrun, measurable    : 12.40 GB   (~124,000 at 10,000/GB)
+
+  email                        reason          used      limit  flows
+  trial-8f21                   quota          12.51G      0.10G      2
+  ali-01                       expired        84.20G   unlimited      1
+  ...
+
+  Per-user cutting is available (access log is on).
+```
+
+Two honesty notes, because a made-up number is worse than no number:
+
+- **over quota** is exact — it is `used - limit`, straight from the DB.
+- **expired / disabled** only shows *traffic used*. We cannot know how much of
+  it happened after the deadline, so it is not counted as "leaked".
+
+Set the price of a gigabyte in `/etc/xui-user-cutoff.conf`
+(`PRICE_PER_GB=10000`) and the audit line becomes money. Set it to `0` to hide
+the figure.
 
 ## Access log (why it is required)
 
@@ -125,6 +207,7 @@ API_ADDR=127.0.0.1:62789
 LOG=/var/log/xui-user-cutoff.log
 POLL=2
 UDP_REJECT=1
+PRICE_PER_GB=10000
 ```
 
 - `POLL` — seconds between DB checks. The DB read is cheap; subprocesses only
@@ -132,6 +215,8 @@ UDP_REJECT=1
 - `UDP_REJECT` — `1` blocks UDP flows with `REJECT` + ICMP instead of `DROP`.
   Helps TCP-like UDP clients react immediately; QUIC clients ignore ICMP either
   way. Set to `0` for a plain `DROP`.
+- `PRICE_PER_GB` — only used by `--audit`. Whatever unit you bill in; printed
+  as-is. `0` hides the money line.
 
 ## Requirements
 
