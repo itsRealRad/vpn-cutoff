@@ -18,7 +18,7 @@ def b64(name):
 WATCHER = b64("xui_user_cutoff.py")
 ACCLOG = b64("set_accesslog.py")
 LOGROT = b64("xray-access.logrotate")
-VERSION = "1.7.0"
+VERSION = "0.0.1"
 
 TEMPLATE = r'''#!/bin/bash
 # xui-user-cutoff installer (self-contained) -- v@VERSION@
