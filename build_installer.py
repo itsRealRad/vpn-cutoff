@@ -26,8 +26,9 @@ TEMPLATE = r'''#!/bin/bash
 # Cuts the LIVE sessions of 3x-ui clients that are expired / over quota /
 # disabled, without restarting xray. TCP sessions die instantly (ss -K on the
 # exact 5-tuple read from xray's access log); UDP/QUIC (hysteria, tuic, masque)
-# are blocked per-flow at the kernel, which the client notices on its own QUIC
-# idle timeout (~18s) -- not instantly, because QUIC ignores ICMP.
+# are blocked per-flow at the kernel; QUIC cannot be cut instantly because it
+# ignores ICMP and does not connect() its UDP socket, so the client only
+# notices on its own idle timeout.
 #
 # Usage:
 #   ./install-xui-cutoff.sh                 # install / upgrade, no log change
@@ -56,6 +57,93 @@ die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 warn(){ printf 'WARN: %s\n' "$*" >&2; }
 
 [ "$(id -u)" = 0 ] || die "must run as root"
+
+# ---------- prerequisites (installed automatically) ----------
+# Everything this tool needs from the OS. Nothing here touches the 3x-ui panel
+# itself -- that must already be installed. Each item is probed with the same
+# command the tool will later use, so "present" means "actually works".
+PKG_MGR=""; PKG_INSTALL=""; PKG_UPDATE=""
+detect_pkg(){
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR=apt; export DEBIAN_FRONTEND=noninteractive
+    PKG_UPDATE="apt-get update -qq"
+    PKG_INSTALL="apt-get install -y -qq --no-install-recommends"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR=dnf; PKG_UPDATE=""; PKG_INSTALL="dnf install -y -q"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MGR=yum; PKG_UPDATE=""; PKG_INSTALL="yum install -y -q"
+  elif command -v apk >/dev/null 2>&1; then
+    PKG_MGR=apk; PKG_UPDATE="apk update -q"; PKG_INSTALL="apk add -q"
+  elif command -v pacman >/dev/null 2>&1; then
+    PKG_MGR=pacman; PKG_UPDATE="pacman -Sy --noconfirm -q"
+    PKG_INSTALL="pacman -S --noconfirm --needed -q"
+  elif command -v zypper >/dev/null 2>&1; then
+    PKG_MGR=zypper; PKG_UPDATE=""; PKG_INSTALL="zypper -q in -y"
+  else
+    die "no supported package manager (apt/dnf/yum/apk/pacman/zypper)"
+  fi
+}
+
+# pkg name differs per distro; try the list in order and stop at the first hit
+pkg_for(){
+  for n in "$@"; do
+    case "$PKG_MGR" in
+      apt|zypper) apt-cache show "$n" >/dev/null 2>&1 && { printf '%s' "$n"; return 0; } ;;
+      *) rpm -q "$n" >/dev/null 2>&1 || true; printf '%s' "$n"; return 0 ;;
+    esac
+  done
+  printf '%s' "$1"
+}
+
+MISSING=""
+need(){ MISSING="${MISSING:+$MISSING }$1"; }
+
+check_prereqs(){
+  MISSING=""          # re-probe from scratch, so this is safe to call twice
+  command -v python3 >/dev/null 2>&1 || need python3
+  # ss -K lives in iproute2; probe -K support, not just the binary
+  if ! command -v ss >/dev/null 2>&1 || ! ss -K -h >/dev/null 2>&1; then
+    need iproute2
+  fi
+  command -v iptables >/dev/null 2>&1 || need iptables
+}
+
+# systemd is the unit runner. There is no non-systemd fallback, but it must be
+# checked AFTER packages are installed so the message is accurate.
+require_systemd(){
+  command -v systemctl >/dev/null 2>&1 \
+    || die "systemd not found; this tool needs a systemd host (no fallback)"
+}
+
+missing_list(){ echo "$MISSING" | xargs 2>/dev/null || echo "$MISSING"; }
+
+install_prereqs(){
+  check_prereqs
+  [ -n "$(missing_list)" ] || return 0
+  local wanted="$MISSING"
+  say "prerequisites missing:$wanted"
+  detect_pkg
+  say "installing via $PKG_MGR ..."
+  local names=""
+  for p in $wanted; do
+    case "$p" in
+      iproute2) names="$names $(pkg_for iproute2 iproute)" ;;
+      iptables) names="$names $(pkg_for iptables iptables-legacy)" ;;
+      python3)  names="$names $(pkg_for python3 python python3-minimal)" ;;
+      *)        names="$names $p" ;;
+    esac
+  done
+  [ -n "$PKG_UPDATE" ] && { $PKG_UPDATE >/dev/null 2>&1 || true; }
+  local rc=0
+  $PKG_INSTALL $names >/dev/null 2>&1 || rc=$?
+  # the install must have produced commands that actually work, not just exit 0
+  check_prereqs
+  if [ -n "$(missing_list)" ]; then
+    die "could not install:$MISSING  (try manually: $PKG_INSTALL$names)"
+  fi
+  [ "$rc" = 0 ] || say "  (package manager returned $rc but every tool now works; continuing)"
+  say "prerequisites satisfied:$wanted"
+}
 
 # ---------- payload ----------
 b64d(){ base64 -d > "$1"; }
@@ -95,13 +183,40 @@ PY
 
 # ---------- actions ----------
 do_status(){
-  detect
+  # probe without dying: --status must work even on a host that is not set up
+  MISSING=""
+  command -v python3 >/dev/null 2>&1 || need python3
+  command -v ss >/dev/null 2>&1 && ss -K -h >/dev/null 2>&1 || need iproute2
+  command -v iptables >/dev/null 2>&1 || need iptables
+  command -v systemctl >/dev/null 2>&1 || MISSING="${MISSING:+$MISSING }systemd"
+  local pre
+  pre=$(missing_list)
+  # detect, but report an incomplete host instead of aborting -- status is a
+  # diagnostic, so it must be able to describe a broken install too
+  DB=""; CONFIG=""; XRAY=""; APIPORT=""
+  for d in /etc/x-ui /usr/local/etc/x-ui; do
+    [ -f "$d/x-ui.db" ] && DB="$d/x-ui.db" && break
+  done
+  for d in /usr/local/x-ui/bin /usr/local/bin /opt/x-ui/bin; do
+    [ -f "$d/config.json" ] && [ -z "$CONFIG" ] && CONFIG="$d/config.json"
+    for b in xray-linux-amd64 xray; do
+      [ -x "$d/$b" ] && [ -z "$XRAY" ] && XRAY="$d/$b"
+    done
+  done
   say "3x-ui cutoff -- status"
+  say "  prereqs     : ${pre:-all present}"
   say "  version     : $( [ -f "$PY" ] && python3 "$PY" --version 2>/dev/null || echo 'not installed')"
   say "  service     : $(systemctl is-active xui-user-cutoff 2>/dev/null || echo inactive) / $(systemctl is-enabled xui-user-cutoff 2>/dev/null || echo disabled)"
-  say "  db          : $DB"
-  say "  config      : $CONFIG"
-  say "  xray        : $XRAY"
+  say "  db          : ${DB:-NOT FOUND}"
+  say "  config      : ${CONFIG:-NOT FOUND}"
+  say "  xray        : ${XRAY:-NOT FOUND}"
+  if [ -z "$DB" ] || [ -z "$CONFIG" ] || [ -z "$XRAY" ]; then
+    say ""
+    say "  3x-ui is not installed on this host."
+    say "  Install the panel first, create one inbound, then re-run this installer."
+    return 1
+  fi
+  detect
   say "  api         : 127.0.0.1:$APIPORT"
   local acc
   acc=$(python3 - "$CONFIG" <<'PY'
@@ -152,6 +267,8 @@ PY
 }
 
 do_install(){
+  install_prereqs
+  require_systemd
   detect
   say "3x-ui cutoff installer v$VERSION"
   say "  db     : $DB"
