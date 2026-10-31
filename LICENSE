@@ -1,0 +1,62 @@
+Copyright (c) 2026 <OWNER>. All rights reserved.
+
+PROPRIETARY LICENSE — NO COPYING, NO REDISTRIBUTION, NO COMMERCIAL USE
+
+This software and its source code, documentation, and any accompanying files
+(the "Software") are the exclusive property of the copyright holder.
+
+PERMITTED, free of charge, to any individual:
+
+  1. To run the Software on servers that you own or are authorized to
+     administer, for your own personal, non-commercial use.
+  2. To make a private backup copy for that same purpose only.
+
+PROHIBITED, without a prior written license from the copyright holder:
+
+  1. COPYING, publishing, mirroring, or otherwise reproducing the Software, in
+     whole or in part, in any form or medium, including re-uploading it to any
+     repository, registry, package index, archive, forum, or website.
+  2. DISTRIBUTING, sublicensing, selling, reselling, renting, leasing, or
+     otherwise making the Software available to any third party, whether for
+     payment or free of charge, including as part of another product, bundle,
+     service, or hosting offering.
+  3. CREATING derivative works, forks, ports, modifications, or translations,
+     or incorporating any part of the Software into another work.
+  4. COMMERCIAL USE of any kind, including internal business use, use in
+     providing a paid service, or use to operate infrastructure that is sold or
+     rented to others.
+  5. Removing, obscuring, or altering this notice or any authorship attribution.
+
+PARTICIPATION — ISSUES AND PULL REQUESTS
+
+Reading the source, opening an issue, and submitting a pull request (patch,
+bug report, suggestion, or any other contribution) to the project's public
+tracker are expressly PERMITTED. You do not need a license to participate.
+
+By submitting a contribution you: (a) grant the copyright holder a perpetual,
+worldwide, royalty-free, irrevocable, sublicensable license to use, reproduce,
+modify, distribute, and relicense that contribution, in whole or in part, as
+part of the Software or under any other terms the copyright holder chooses;
+and (b) confirm that you have the legal right to grant it.
+
+A contribution does not give you ownership of, or any right to redistribute,
+the Software. The prohibitions above still apply to the Software as a whole,
+including any version that contains your contribution.
+
+NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+NOTE ON THE OPERATING SYSTEM
+
+This is a source-available proprietary license, not an open-source license. It
+is intentionally incompatible with the Open Source Definition, because it
+forbids redistribution and derivative works.
+
+For any use not expressly permitted above, contact the copyright holder for a
+separate written license.
