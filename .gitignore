@@ -1,7 +1,8 @@
 __pycache__/
-*.pyc
+*.py[cod]
 probe_*.py
 bench_*.py
 recon_*.py
-e2e_test.py
+publish*.py
 *.log
+*.bak
