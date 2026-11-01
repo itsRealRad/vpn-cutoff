@@ -43,14 +43,13 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 
-# How long a user we just cut is re-checked every cycle. The panel's own sweep
-# that removes the client from the config runs on a ~5 min cadence, so a
-# user who crossed the boundary can still reconnect for up to that long; keep a
-# window slightly wider than that. Outside this window, and when the invalid set
-# has not changed, the expensive subprocesses (xray api, ss, awg) are NOT run.
-WATCH_SEC = 360
+# Every cycle re-reads the invalid client set and cuts any invalid client that
+# is online -- deliberately with NO time window and no "did the set change" test.
+# Both of those were tried and both leaked: a client that was already invalid
+# but offline was never looked at again once it reconnected, so it could pull
+# traffic for as long as it stayed connected.
 
 # config.json is read once per process and re-read only when its mtime moves.
 _PORT_CACHE = {}
@@ -503,10 +502,25 @@ def udp_ports(cfg):
         if i.get("protocol") == "tunnel":
             continue
         proto = (i.get("protocol") or "").lower()
-        net = ((i.get("streamSettings") or {}).get("network") or "").lower()
-        is_udp = (proto in UDP_PROTOCOLS) or (net in UDP_NETWORKS)
-        if proto in TCP_PROTOCOLS and net not in UDP_NETWORKS:
+        ss = i.get("streamSettings") or {}
+        st = i.get("settings") or {}
+        net = (ss.get("network") or "").lower()
+        # A protocol that carries both transports (shadowsocks) declares them in
+        # settings.network, e.g. "tcp,udp". That is authoritative and must win
+        # over the protocol name, or its UDP half is silently handled by ss -K,
+        # which cannot touch a UDP session. Also read the settings-proto string
+        # that a few panels put the same information in.
+        blob = ",".join(str(st.get(k) or "") for k in ("network", "protocol"))
+        nets = {x.strip().lower()
+                for x in (net + "," + blob).replace("/", ",").split(",") if x.strip()}
+        if "udp" in nets:
+            is_udp = True
+        elif "tcp" in nets:
             is_udp = False
+        else:
+            is_udp = (proto in UDP_PROTOCOLS) or (net in UDP_NETWORKS)
+            if proto in TCP_PROTOCOLS and net not in UDP_NETWORKS:
+                is_udp = False
         if is_udp:
             p = _inbound_port(i)
             if p is not None:
@@ -687,32 +701,37 @@ def wg_cutoff(cfg, invalid, dry=False):
     return removed
 
 
-def one_cycle(cfg, dry=False, state=None):
-    """Cheap DB read every cycle; expensive subprocesses only when needed.
+def did_work(r):
+    """True when a cycle actually killed, dropped or released something.
 
-    The poll exists to notice a user crossing a boundary, not to run the kill
-    machinery. Read the invalid set (a local SQLite query, no subprocess); if it
-    is unchanged AND no recently-cut user is still in the watch window, there is
-    nothing to do and no subprocess runs. That is the common case: on a box where
-    nobody expires for an hour, an hour of polls costs only the DB reads.
+    The watcher now looks at every cycle, so logging unconditionally would write
+    a line every POLL seconds forever. Only changes are worth a line.
+    """
+    if r.get("error"):
+        return True
+    if r.get("killed") or r.get("skipped"):
+        return True
+    udp = r.get("udp") or {}
+    if udp.get("added") or udp.get("removed"):
+        return True
+    pf = r.get("perflow") or {}
+    if pf.get("killed") or pf.get("added") or pf.get("removed"):
+        return True
+    return False
+
+
+def one_cycle(cfg, dry=False, state=None):
+    """Every cycle: find invalid clients, cut the ones that are online.
+
+    This is a STATE check, not an event check. An earlier version only acted
+    when the invalid set CHANGED, which meant a client that was already invalid
+    but offline was never looked at again once it reconnected -- it could pull
+    traffic for as long as it liked. Any client that is invalid and online is
+    cut on the cycle that sees it, however it got there.
     """
     inv = invalid_users(cfg)
-    now = time.time()
     if state is None:
-        state = {"prev_inv": None, "watch": {}}
-
-    # a first cycle (prev None) counts as changed, so pre-existing invalid users
-    # that may still hold live sockets are cleaned once at startup
-    changed = state["prev_inv"] != inv
-    watch = {e: t for e, t in state.get("watch", {}).items() if now - t < WATCH_SEC}
-    if state["prev_inv"] is not None:
-        # only a user that JUST became invalid is worth re-checking; on the first
-        # cycle every invalid user looks "new" but nothing actually happened now
-        for e in inv:
-            if e not in state["prev_inv"]:
-                watch[e] = now
-    state["watch"] = watch
-    state["prev_inv"] = dict(inv)
+        state = {}
 
     if not inv:
         # nothing is invalid -- but a DROP we installed earlier might still be
@@ -726,10 +745,6 @@ def one_cycle(cfg, dry=False, state=None):
         return {"invalid": 0, "killed": 0, "skipped": 0, "awg": 0, "udp": udp,
                 "perflow": perflow, "reason": None,
                 "ran": bool(udp.get("removed") or (perflow and perflow.get("removed")))}
-    if not changed and not watch:
-        return {"invalid": len(inv), "killed": 0, "skipped": 0, "awg": 0,
-                "udp": {"added": 0, "removed": 0, "skipped": 0},
-                "reason": None, "ran": False}
 
     m, err = online_ip_map(cfg)
     if m is None:
@@ -907,11 +922,10 @@ def main():
         return 0
 
     log(cfg["LOG"], "start v%s poll=%ss db=%s" % (VERSION, cfg["POLL"], cfg["DB"]))
-    state = {"prev_inv": None, "watch": {}}
     while True:
         try:
-            r = one_cycle(cfg, state=state)
-            if r.get("ran"):
+            r = one_cycle(cfg)
+            if did_work(r):
                 log(cfg["LOG"], "cycle %s" % json.dumps(r))
         except Exception as e:
             log(cfg["LOG"], "cycle error: %s" % e)
@@ -920,6 +934,7 @@ def main():
 
 def selftest(cfg):
     fails = 0
+    orig_inv = globals()["invalid_users"]
 
     def check(name, cond):
         nonlocal fails
@@ -1010,7 +1025,72 @@ def selftest(cfg):
         check("classify: vless/vmess/ss are NOT UDP",
               not ({1005, 1006, 1007, 1008} & u))
         check("classify: internal 'tunnel' api inbound is excluded", 1009 not in u)
+
+        # a protocol that carries BOTH transports declares it in settings.network
+        # ("tcp,udp"); its UDP half must not be handed to ss -K, which cannot cut
+        # a UDP session. This is the live shape of a shadowsocks dual inbound.
+        json.dump({"inbounds": [
+            {"protocol": "shadowsocks", "port": 2360,
+             "settings": {"network": "tcp,udp", "method": "aes-128-gcm"},
+             "streamSettings": {"network": "tcp,udp"}},
+            {"protocol": "shadowsocks", "port": 2361,
+             "settings": {"network": "tcp"},
+             "streamSettings": {"network": "tcp"}},
+        ]}, open(cfgp["CONFIG"], "w"))
         _PORT_CACHE.clear()
+        u2 = udp_ports(cfgp)
+        check("classify: shadowsocks tcp,udp inbound IS UDP", 2360 in u2)
+        check("classify: shadowsocks tcp-only inbound is NOT UDP", 2361 not in u2)
+        _PORT_CACHE.clear()
+
+    # --- the regression that leaked in production ---------------------------
+    # A client that was ALREADY invalid (quota long gone) and OFFLINE must be
+    # cut the moment it reconnects -- not only when the invalid set changes.
+    # Reproduces the exact shape of the incident: the set never changes, the
+    # client simply connects later.
+    seen = []
+    o_kill, o_online, o_ports, o_udps = (
+        globals()["kill_ip"], globals()["online_ip_map"],
+        globals()["own_ports"], globals()["udp_ports"])
+    o_pf, o_wg, o_udpc = (globals()["perflow_cutoff"], globals()["wg_cutoff"],
+                          globals()["udp_cutoff"])
+    o_ed, o_efd, o_alog = (globals()["existing_drops"],
+                           globals()["existing_flow_drops"],
+                           globals()["access_log_path"])
+    globals()["invalid_users"] = lambda c: {"Rad": "quota"}
+    globals()["own_ports"] = lambda c: {2360}
+    globals()["udp_ports"] = lambda c: {2360}
+    globals()["existing_drops"] = lambda c: set()
+    globals()["existing_flow_drops"] = lambda c: set()
+    globals()["access_log_path"] = lambda c: "/dev/null"
+    globals()["wg_cutoff"] = lambda c, i, dry=False: 0
+    globals()["udp_cutoff"] = lambda c, i, m, dry=False: {
+        "added": 0, "removed": 0, "skipped": 0}
+    globals()["perflow_cutoff"] = lambda c, i, o, u, dry=False: None
+    globals()["kill_ip"] = lambda c, ip, ports: (seen.append(ip) or 1)
+    try:
+        # cycle 1: Rad invalid but NOT connected yet
+        globals()["online_ip_map"] = lambda c: ({}, None)
+        r1 = one_cycle(cfg)
+        check("regression: nothing to cut while the invalid client is offline",
+              seen == [] and r1.get("killed") == 0)
+        # cycle 2: the SAME invalid set -- Rad simply connected now
+        globals()["online_ip_map"] = lambda c: ({"203.0.113.7": {"Rad"}}, None)
+        r2 = one_cycle(cfg)
+        check("regression: already-invalid client IS cut when it reconnects",
+              seen == ["203.0.113.7"] and r2.get("killed") == 1)
+        # cycle 3: still connected -> cut again (no window, no cooldown)
+        r3 = one_cycle(cfg)
+        check("regression: re-cut on the next cycle, no watch window",
+              len(seen) == 2 and r3.get("killed") == 1)
+    finally:
+        for n, f in (("kill_ip", o_kill), ("online_ip_map", o_online),
+                     ("own_ports", o_ports), ("udp_ports", o_udps),
+                     ("perflow_cutoff", o_pf), ("wg_cutoff", o_wg),
+                     ("udp_cutoff", o_udpc), ("existing_drops", o_ed),
+                     ("existing_flow_drops", o_efd), ("access_log_path", o_alog)):
+            globals()[n] = f
+        globals()["invalid_users"] = orig_inv
 
     # --- UDP cutoff decision logic (rule layer mocked, no iptables touched) ---
     cfg3 = dict(cfg)
