@@ -53,8 +53,15 @@ exposes:
 ## What it does
 
 Every 2 seconds it reads the panel DB (read-only) for clients that are
-disabled, expired, or over quota. For any of them still online, it cuts the
-exact session using the lever from the table above.
+disabled, expired, or over quota, and cuts the live session of **every one of
+them that is online** — using the lever from the table above.
+
+This is a **state** check, not an event check: it does not wait for a client to
+*cross* the boundary. A client that went over quota while offline, and only
+connects hours later, is cut on the first cycle that sees it. That distinction
+matters — an event-driven version passes every test you write for "user expires
+while connected" and still leaks an entire client, because the client that is
+already invalid never triggers the event again.
 
 No restart, ever. The core process is not touched.
 
